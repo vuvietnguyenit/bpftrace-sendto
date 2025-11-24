@@ -2,8 +2,6 @@
 
 The bpftrace script that helps to trace full payload that included destination address of sendto() syscall.
 
-In this script, I used mysqld process as an example that I will create a tracing on it. Everyone can use the same mechanism to trace another process.
-
 ## Requirements
 
 - bpftrace is installed
