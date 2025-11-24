@@ -1,0 +1,98 @@
+/*
+Copyright (C) 2025 Vu Nguyenn <vuvietnguyenit.github.io>
+This software is licensed under the MIT License.
+
+The program helps trace response back to client by MySQL server without access to client for check what is happening by see logs.
+Agruments have included in this tracing:
+- $1 -> COMM (command-line of process). Can get by `ps -eT -o comm`
+
+We need to declare two hashmaps those can help us keep track information between syscalls and entry/return sections.
+
+Hashmaps:
+- map fd_info: tid -> *sockaddr # Because we want to thread-safe here, let's use TID as key, not PID
+- map fd_address: fd -> *sockaddr # This map holds sockaddrs these will use to check what destination 
+										address of client
+
+# Theory:
+
+When a new connection is sent to mysqld proc, it will call accept() syscall which use socket() syscall to create new 
+socket connection before. The socket connections hold client's address that refers to a file descriptor (fd). 
+So the value is returned by accept() syscall is an fd value which can be used in the future to send payload to 
+destination address. 
+This call is synchronous.
+The sendto() syscall will use this fd to pass payload, that will send back to client.
+
+Example strace outside connection:
+[pid 29664] accept(22, {sa_family=AF_INET6, sin6_port=htons(47698), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:10.196.6.35", &sin6_addr), sin6_scope_id=0}, [128 => 28]) = 35
+[pid 29963] sendto(35, "J\0\0\0\n8.0.31\0+b\0\0\0213ls\rn\2u\0\377\367\377\2\0\377\237"..., 78, MSG_DONTWAIT, NULL, 0) = 78
+
+Example strace inside connection (from local - the same host):
+[pid 29664] accept(24, {sa_family=AF_UNIX}, [128 => 2]) = 35
+[pid 29963] sendto(35, "J\0\0\0\n8.0.31\0\357f\0\0Y}\1\26\25\\<U\0\377\367\377\2\0\377\237"..., 78, MSG_DONTWAIT, NULL, 0) = 78
+
+For AF_UNIX family type, the destination address always is localhost. So, we don't need to consider how get destination by AF_UNIX socket
+
+Flow:
+accept():fd -> sendto(fd, payload, ...)
+
+# Implementation:
+- Filter out all syscalls that don't belong to the mysqld process (put COMM of process in argument #1 when run this script) 
+- Read TID, sockaddr of accept() syscall when it is entered.
+- When accept() syscall returned the new fd, insert it to map with key=fd, value=sockaddr pointer.
+- Create a probe that attaches to sendto() syscall, read buffer msg content, lookup in the map to get the corresponding sockaddr .
+
+*If you want to see all args of syscalls when use bpftrace, let try: bpftrace -vl tracepoint:syscalls:sys_enter_accept* 
+
+*/
+begin {
+	printf("Tracing accept, sendto syscalls... Hit Ctrl-C to end.\n");
+}
+
+let @fd_info = hash(100);
+let @fd_address = hash(100); // the map hold value of FD -> socket address
+
+tracepoint:syscalls:sys_enter_accept,tracepoint:syscalls:sys_enter_accept4 {
+	// we just strace mysqld process
+	if (comm != $1) { return }
+	@fd_info[tid] = args.upeer_sockaddr;
+}
+
+tracepoint:syscalls:sys_exit_accept,tracepoint:syscalls:sys_exit_accept4 /args.ret >= 0/ {
+	if (comm != $1) { return }
+	if (has_key(@fd_info, tid) != 1) { return }
+	$ptr_addr = @fd_info[tid];
+	@fd_address[args.ret] = $ptr_addr;
+}
+
+
+tracepoint:syscalls:sys_enter_sendto {
+	if (has_key(@fd_address, args.fd) != 1) {
+		return;
+	}
+	let $ipaddr;
+	$ptr_addr = @fd_address[args.fd];
+	if ($ptr_addr->sa_family == 10) { // AF_INET6. See https://elixir.bootlin.com/linux/v6.17.1/source/include/linux/socket.h#L201
+		$sockv6 = (struct sockaddr_in6*)$ptr_addr;
+		$ipaddr = ntop(10, $sockv6->sin6_addr.in6_u.u6_addr8); // convert to human-readable IP address
+		printf("pid=%d tid=%d comm=%s fd=%d msg=%r len=%d flg=%d addr_len=%d family=%d dest=%s\n", pid, tid, comm, args.fd, buf(args.buff, 128), args.len, args.flags, args.addr_len, $sockv6->sin6_family, $ipaddr);
+	} else if ($ptr_addr->sa_family == 1) { // AF_UNIX 
+		// got it from localhost
+		$sock = (struct sockaddr_in*)$ptr_addr;
+		$host = "localhost";
+		printf("pid=%d tid=%d comm=%s fd=%d msg=%r len=%d flg=%d addr_len=%d family=%d dest=%s\n", pid, tid, comm, args.fd, buf(args.buff, 128), args.len, args.flags, args.addr_len, $sock->sin_family, $host);
+
+	} else if ($ptr_addr->sa_family == 2) {  // AF_INET
+		$sock = (struct sockaddr_in*)$ptr_addr;
+		$ipaddr = ntop(2, $sock->sin_addr.s_addr);
+		printf("pid=%d tid=%d comm=%s fd=%d msg=%r len=%d flg=%d addr_len=%d family=%d dest=%s\n", pid, tid, comm, args.fd, buf(args.buff, 128), args.len, args.flags, args.addr_len, $sock->sin_family, $ipaddr);
+
+	} else { print("Unknown packet") }
+
+}
+
+end {
+	clear(@fd_info);
+	clear(@fd_address);
+}
+
+
