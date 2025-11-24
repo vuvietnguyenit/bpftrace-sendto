@@ -46,6 +46,9 @@ accept():fd -> sendto(fd, payload, ...)
 */
 begin {
 	printf("Tracing accept, sendto syscalls... Hit Ctrl-C to end.\n");
+	if ($1 == ".") {
+		printf("Start trace all process\n");
+	}
 }
 
 let @fd_info = hash(100);
@@ -53,12 +56,19 @@ let @fd_address = hash(100); // the map hold value of FD -> socket address
 
 tracepoint:syscalls:sys_enter_accept,tracepoint:syscalls:sys_enter_accept4 {
 	// we just strace mysqld process
-	if (comm != $1) { return }
-	@fd_info[tid] = args.upeer_sockaddr;
+	if ($1 != ".") {
+		if (comm != $1) { return }
+		@fd_info[tid] = args.upeer_sockaddr;
+	} else  {
+		@fd_info[tid] = args.upeer_sockaddr;
+	}
+	
 }
 
 tracepoint:syscalls:sys_exit_accept,tracepoint:syscalls:sys_exit_accept4 /args.ret >= 0/ {
-	if (comm != $1) { return }
+	if ($1 != ".") {
+		if (comm != $1) { return }
+	}
 	if (has_key(@fd_info, tid) != 1) { return }
 	$ptr_addr = @fd_info[tid];
 	@fd_address[args.ret] = $ptr_addr;
@@ -86,7 +96,9 @@ tracepoint:syscalls:sys_enter_sendto {
 		$ipaddr = ntop(2, $sock->sin_addr.s_addr);
 		printf("pid=%d tid=%d comm=%s fd=%d msg=%r len=%d flg=%d addr_len=%d family=%d dest=%s\n", pid, tid, comm, args.fd, buf(args.buff, 128), args.len, args.flags, args.addr_len, $sock->sin_family, $ipaddr);
 
-	} else { print("Unknown packet") }
+	} else { 
+		printf("pid=%d tid=%d comm=%s fd=%d msg=%r sa_family=%d\n", pid, tid, comm, args.fd, buf(args.buff, 128), $ptr_addr->sa_family);
+	}
 
 }
 
